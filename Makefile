@@ -12,10 +12,9 @@ PACKAGE_VERSION = 2.4.1
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = YTMusicUltimate
-# Compile only the adaptive 9.26.2 downloader implementation. The original
-# downloader and the earlier v2 fixed downloader hook the same methods, so they
-# must be excluded to avoid duplicate hooks/runtime crashes.
-$(TWEAK_NAME)_FILES = $(filter-out Source/Sideloading.x Source/Downloading.x Source/DownloadingFixed.x, $(wildcard Source/*.x))
+# Compile only the newest YTM 9.26.2 downloader implementation. Older
+# downloader files hook the same methods and must stay excluded.
+$(TWEAK_NAME)_FILES = $(filter-out Source/Sideloading.x Source/Downloading.x Source/DownloadingFixed.x Source/DownloadingAdaptive.x, $(wildcard Source/*.x))
 $(TWEAK_NAME)_FILES += $(shell find Source -name '*.m')
 $(TWEAK_NAME)_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -DTWEAK_VERSION=$(PACKAGE_VERSION)
 $(TWEAK_NAME)_FRAMEWORKS = UIKit Foundation AVFoundation AudioToolbox VideoToolbox
