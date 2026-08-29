@@ -12,9 +12,10 @@ PACKAGE_VERSION = 2.4.1
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = YTMusicUltimate
-# Use DownloadingFixed.x instead of the original downloader. 9.26.2 changed
-# the now-playing controller hierarchy and the old code crashes on playerResponse.
-$(TWEAK_NAME)_FILES = $(filter-out Source/Sideloading.x Source/Downloading.x, $(wildcard Source/*.x))
+# Compile only the adaptive 9.26.2 downloader implementation. The original
+# downloader and the earlier v2 fixed downloader hook the same methods, so they
+# must be excluded to avoid duplicate hooks/runtime crashes.
+$(TWEAK_NAME)_FILES = $(filter-out Source/Sideloading.x Source/Downloading.x Source/DownloadingFixed.x, $(wildcard Source/*.x))
 $(TWEAK_NAME)_FILES += $(shell find Source -name '*.m')
 $(TWEAK_NAME)_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -DTWEAK_VERSION=$(PACKAGE_VERSION)
 $(TWEAK_NAME)_FRAMEWORKS = UIKit Foundation AVFoundation AudioToolbox VideoToolbox
