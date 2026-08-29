@@ -20,6 +20,12 @@ jobs:
       APP_NAME: "YouTube Music"
 
     steps:
+      - name: Checkout patched YTMusicUltimate source
+        uses: actions/checkout@v6.0.2
+        with:
+          path: main
+          submodules: recursive
+
       - name: Download previously built 9.26.2 IPA
         env:
           GH_TOKEN: ${{ github.token }}
@@ -32,7 +38,7 @@ jobs:
             -o base.ipa
           unzip -tq base.ipa
 
-      - name: Remove old conflicting tweak injections
+      - name: Prepare the known-working clean base
         run: |
           rm -rf work
           mkdir work
@@ -58,8 +64,7 @@ jobs:
                   data = data.replace(old_b, repl)
               print(f'{old}: replaced {count}')
 
-          # Disable every old injected load command. The fixed tweak will be
-          # injected fresh by cyan in the next step.
+          # This reproduces the clean-login build that already works on-device.
           replace_padded('@rpath/blatantsPatch.dylib', '@rpath/noPatch.dylib')
           replace_padded('@rpath/ReturnYouTubeMusicDislikes.dylib', '@rpath/noDislikes.dylib')
           replace_padded('@rpath/YTMusicUltimate.dylib', '@rpath/YTMDisabled.dylib')
@@ -78,8 +83,6 @@ jobs:
               elif p.exists():
                   p.unlink()
 
-          # Remove stale signatures; the injector will fakesign again and
-          # ESign will apply the real AppTester signature afterward.
           for sig in app.rglob('_CodeSignature'):
               if sig.is_dir():
                   shutil.rmtree(sig, ignore_errors=True)
@@ -90,31 +93,61 @@ jobs:
           cd ..
           unzip -tq cleanbase.ipa
 
+      - name: Install build dependencies
+        run: brew install make ldid
+
+      - name: Set Theos environment
+        run: |
+          echo "$(brew --prefix make)/libexec/gnubin" >> $GITHUB_PATH
+          echo "THEOS=${{ github.workspace }}/theos" >> $GITHUB_ENV
+
+      - name: Setup Theos
+        uses: actions/checkout@v6.0.2
+        with:
+          repository: theos/theos
+          ref: 9bc73406cf80b711ef4d02c15ff1dedc4478a275
+          path: theos
+          submodules: recursive
+
+      - name: Download iOS SDK
+        run: |
+          git clone --quiet -n --depth=1 --filter=tree:0 https://github.com/theos/sdks.git
+          cd sdks
+          git sparse-checkout set --no-cone iPhoneOS16.5.sdk
+          git checkout
+          mv *.sdk $THEOS/sdks
+
+      - name: Clone required headers
+        run: |
+          cd $THEOS/include
+          git clone --quiet --depth=1 https://github.com/PoomSmart/YouTubeHeader.git
+          git clone --quiet --depth=1 https://github.com/PoomSmart/PSHeader.git
+          git clone --quiet --depth=1 https://github.com/PoomSmart/YouTubeMusicHeader.git
+
+      - name: Build patched YTMusicUltimate for sideloading
+        run: |
+          cd main
+          make clean package DEBUG=0 FINALPACKAGE=1 SIDELOADING=1
+          mv packages/*.deb ../ytmult-patched.deb
+
       - name: Install cyan injector
         run: pipx install --force https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
 
-      - name: Download YTMusicUltimate 2.4.1 fixed-download package
-        run: |
-          curl -fL --retry 3 --retry-delay 2 \
-            -o fixed-downloads.deb \
-            https://files.catbox.moe/u8c7df.deb
-          test -s fixed-downloads.deb
-
-      - name: Inject fixed downloader and preserve AppTester bundle ID
+      - name: Inject patched downloader and preserve AppTester bundle ID
         run: |
           cyan \
             -i cleanbase.ipa \
-            -o YTMusicUltimate_9.26.2_LockScreen_DownloadFix.ipa \
-            -u -w -s -f fixed-downloads.deb \
+            -o YTMusicUltimate_9.26.2_PlayerCrashFix.ipa \
+            -u -w -s -f ytmult-patched.deb \
             -n "$APP_NAME" \
             -b "$BUNDLE_ID" \
             --overwrite
-          unzip -tq YTMusicUltimate_9.26.2_LockScreen_DownloadFix.ipa
+          unzip -tq YTMusicUltimate_9.26.2_PlayerCrashFix.ipa
 
       - name: Verify final IPA
         run: |
           rm -rf verify
-          unzip -q YTMusicUltimate_9.26.2_LockScreen_DownloadFix.ipa -d verify
+          unzip -q YTMusicUltimate_9.26.2_PlayerCrashFix.ipa -d verify
           python3 <<'PY'
           import plistlib
           from pathlib import Path
@@ -130,17 +163,17 @@ jobs:
 
           dylib = app / 'Frameworks/YTMusicUltimate.dylib'
           if not dylib.exists():
-              raise SystemExit('Fixed YTMusicUltimate.dylib was not injected')
-          print('YTMusicUltimate dylib size:', dylib.stat().st_size)
+              raise SystemExit('Patched YTMusicUltimate.dylib was not injected')
+          print('Patched dylib size:', dylib.stat().st_size)
           PY
 
       - name: Create draft release
         uses: softprops/action-gh-release@v2.5.0
         with:
-          tag_name: download-fix-${{ github.run_number }}
-          name: YouTube Music 9.26.2 - Lock Screen + Download Fix
-          files: YTMusicUltimate_9.26.2_LockScreen_DownloadFix.ipa
+          tag_name: player-crash-fix-${{ github.run_number }}
+          name: YouTube Music 9.26.2 - Download Player Crash Fix
+          files: YTMusicUltimate_9.26.2_PlayerCrashFix.ipa
           draft: true
 
       - name: Output release URL
-        run: echo "::notice::Fixed IPA available at https://github.com/${GITHUB_REPOSITORY}/releases"
+        run: echo "::notice::Patched IPA available at https://github.com/${GITHUB_REPOSITORY}/releases"
