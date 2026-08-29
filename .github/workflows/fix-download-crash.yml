@@ -26,7 +26,7 @@ jobs:
           path: main
           submodules: recursive
 
-      - name: Download previously built 9.26.2 IPA
+      - name: Download known 9.26.2 base IPA
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -38,7 +38,7 @@ jobs:
             -o base.ipa
           unzip -tq base.ipa
 
-      - name: Prepare the known-working clean base
+      - name: Prepare same clean base that worked on device
         run: |
           rm -rf work
           mkdir work
@@ -46,13 +46,12 @@ jobs:
 
           python3 <<'PY'
           from pathlib import Path
-          import shutil
 
           app = Path('work/Payload/YouTubeMusic.app')
           exe = app / 'YouTubeMusic'
           data = bytearray(exe.read_bytes())
 
-          def replace_padded(old: str, new: str):
+          def replace_all_padded(old: str, new: str):
               global data
               old_b = old.encode()
               new_b = new.encode()
@@ -60,41 +59,58 @@ jobs:
                   raise RuntimeError(f'Replacement too long: {new}')
               repl = new_b + b'\0' * (len(old_b) - len(new_b))
               count = data.count(old_b)
-              if count:
-                  data = data.replace(old_b, repl)
+              data = data.replace(old_b, repl)
               print(f'{old}: replaced {count}')
+              return count
 
-          # This reproduces the clean-login build that already works on-device.
-          replace_padded('@rpath/blatantsPatch.dylib', '@rpath/noPatch.dylib')
-          replace_padded('@rpath/ReturnYouTubeMusicDislikes.dylib', '@rpath/noDislikes.dylib')
-          replace_padded('@rpath/YTMusicUltimate.dylib', '@rpath/YTMDisabled.dylib')
+          def replace_occurrence_padded(old: str, new: str, occurrence: int):
+              global data
+              old_b = old.encode()
+              new_b = new.encode()
+              if len(new_b) > len(old_b):
+                  raise RuntimeError(f'Replacement too long: {new}')
+              positions = []
+              start = 0
+              while True:
+                  pos = data.find(old_b, start)
+                  if pos < 0:
+                      break
+                  positions.append(pos)
+                  start = pos + len(old_b)
+              print(f'{old}: found {len(positions)} occurrence(s)')
+              if len(positions) <= occurrence:
+                  raise RuntimeError(f'Expected at least {occurrence + 1} occurrences of {old}')
+              pos = positions[occurrence]
+              repl = new_b + b'\0' * (len(old_b) - len(new_b))
+              data[pos:pos+len(old_b)] = repl
+
+          # Match the Clean_LoginTest build that already opened and logged in.
+          replace_all_padded('@rpath/blatantsPatch.dylib', '@rpath/noPatch.dylib')
+          replace_all_padded('@rpath/ReturnYouTubeMusicDislikes.dylib', '@rpath/noDislikes.dylib')
+
+          # The original input had YTMusicUltimate already, and the first GitHub
+          # builder injected it a second time. Keep the FIRST real load command and
+          # disable only the SECOND duplicate. Replacing both caused the DYLD
+          # "duplicate linked dylib YTMDisabled.dylib" launch crash.
+          replace_occurrence_padded('@rpath/YTMusicUltimate.dylib', '@rpath/YTMDisabled.dylib', 1)
           exe.write_bytes(data)
 
+          # These two old tweaks conflicted with the sideload/login patch.
           for rel in [
               'Frameworks/blatantsPatch.dylib',
               'Frameworks/ReturnYouTubeMusicDislikes.dylib',
-              'Frameworks/YTMusicUltimate.dylib',
-              'Frameworks/CydiaSubstrate.framework',
-              'YTMusicUltimate.bundle',
           ]:
               p = app / rel
-              if p.is_dir():
-                  shutil.rmtree(p, ignore_errors=True)
-              elif p.exists():
+              if p.exists():
                   p.unlink()
 
-          for sig in app.rglob('_CodeSignature'):
-              if sig.is_dir():
-                  shutil.rmtree(sig, ignore_errors=True)
+          # IMPORTANT: keep the existing YTMusicUltimate.dylib, its bundle, and
+          # CydiaSubstrate.framework. We replace that dylib in-place later rather
+          # than injecting another LC_LOAD_DYLIB command.
           PY
 
-          cd work
-          zip -qry ../cleanbase.ipa Payload
-          cd ..
-          unzip -tq cleanbase.ipa
-
       - name: Install build dependencies
-        run: brew install make ldid
+        run: brew install make ldid dpkg
 
       - name: Set Theos environment
         run: |
@@ -130,24 +146,43 @@ jobs:
           make clean package DEBUG=0 FINALPACKAGE=1 SIDELOADING=1
           mv packages/*.deb ../ytmult-patched.deb
 
-      - name: Install cyan injector
-        run: pipx install --force https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
-
-      - name: Inject patched downloader and preserve AppTester bundle ID
+      - name: Replace existing YTMusicUltimate with patched build
         run: |
-          cyan \
-            -i cleanbase.ipa \
-            -o YTMusicUltimate_9.26.2_PlayerCrashFix.ipa \
-            -u -w -s -f ytmult-patched.deb \
-            -n "$APP_NAME" \
-            -b "$BUNDLE_ID" \
-            --overwrite
-          unzip -tq YTMusicUltimate_9.26.2_PlayerCrashFix.ipa
+          rm -rf package
+          mkdir package
+          dpkg-deb -x ytmult-patched.deb package
 
-      - name: Verify final IPA
+          DYLIB=$(find package -type f -name 'YTMusicUltimate.dylib' -print -quit)
+          BUNDLE=$(find package -type d -name 'YTMusicUltimate.bundle' -print -quit)
+
+          echo "Built dylib: $DYLIB"
+          echo "Built bundle: $BUNDLE"
+          test -n "$DYLIB"
+          test -n "$BUNDLE"
+
+          # Match the dependency layout used by sideloaded IPAs.
+          install_name_tool -change \
+            /Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate \
+            @rpath/CydiaSubstrate.framework/CydiaSubstrate \
+            "$DYLIB" || true
+
+          APP='work/Payload/YouTubeMusic.app'
+          cp -f "$DYLIB" "$APP/Frameworks/YTMusicUltimate.dylib"
+          rm -rf "$APP/YTMusicUltimate.bundle"
+          cp -R "$BUNDLE" "$APP/YTMusicUltimate.bundle"
+
+          # Remove stale signatures. ESign will apply the real AppTester signature.
+          find "$APP" -type d -name _CodeSignature -prune -exec rm -rf {} + || true
+
+          cd work
+          zip -qry ../YTMusicUltimate_9.26.2_PlayerCrashFix_v2.ipa Payload
+          cd ..
+          unzip -tq YTMusicUltimate_9.26.2_PlayerCrashFix_v2.ipa
+
+      - name: Verify final IPA structure
         run: |
           rm -rf verify
-          unzip -q YTMusicUltimate_9.26.2_PlayerCrashFix.ipa -d verify
+          unzip -q YTMusicUltimate_9.26.2_PlayerCrashFix_v2.ipa -d verify
           python3 <<'PY'
           import plistlib
           from pathlib import Path
@@ -156,23 +191,29 @@ jobs:
           with open(app / 'Info.plist', 'rb') as f:
               info = plistlib.load(f)
 
-          bundle = info.get('CFBundleIdentifier')
-          print('Bundle ID:', bundle)
-          if bundle != 'app.raspberry1880.gooseberry6361':
+          if info.get('CFBundleIdentifier') != 'app.raspberry1880.gooseberry6361':
               raise SystemExit('Unexpected bundle ID')
+
+          exe = (app / 'YouTubeMusic').read_bytes()
+          real = exe.count(b'@rpath/YTMusicUltimate.dylib')
+          disabled = exe.count(b'@rpath/YTMDisabled.dylib')
+          print('Real YTMusicUltimate loads:', real)
+          print('Disabled duplicate loads:', disabled)
+          if real != 1 or disabled != 1:
+              raise SystemExit('Unexpected YTMusicUltimate load-command layout')
 
           dylib = app / 'Frameworks/YTMusicUltimate.dylib'
           if not dylib.exists():
-              raise SystemExit('Patched YTMusicUltimate.dylib was not injected')
+              raise SystemExit('Patched YTMusicUltimate.dylib missing')
           print('Patched dylib size:', dylib.stat().st_size)
           PY
 
       - name: Create draft release
         uses: softprops/action-gh-release@v2.5.0
         with:
-          tag_name: player-crash-fix-${{ github.run_number }}
-          name: YouTube Music 9.26.2 - Download Player Crash Fix
-          files: YTMusicUltimate_9.26.2_PlayerCrashFix.ipa
+          tag_name: player-crash-fix-v2-${{ github.run_number }}
+          name: YouTube Music 9.26.2 - Download Fix v2
+          files: YTMusicUltimate_9.26.2_PlayerCrashFix_v2.ipa
           draft: true
 
       - name: Output release URL
