@@ -1,0 +1,146 @@
+name: Build YTMusicUltimate Download Fix
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ytm-download-fix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Download-Fixed IPA
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    env:
+      BASE_ASSET_ID: "506314675"
+      BUNDLE_ID: "app.raspberry1880.gooseberry6361"
+      APP_NAME: "YouTube Music"
+
+    steps:
+      - name: Download previously built 9.26.2 IPA
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl -fL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/octet-stream" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/${BASE_ASSET_ID}" \
+            -o base.ipa
+          unzip -tq base.ipa
+
+      - name: Remove old conflicting tweak injections
+        run: |
+          rm -rf work
+          mkdir work
+          unzip -q base.ipa -d work
+
+          python3 <<'PY'
+          from pathlib import Path
+          import shutil
+
+          app = Path('work/Payload/YouTubeMusic.app')
+          exe = app / 'YouTubeMusic'
+          data = bytearray(exe.read_bytes())
+
+          def replace_padded(old: str, new: str):
+              global data
+              old_b = old.encode()
+              new_b = new.encode()
+              if len(new_b) > len(old_b):
+                  raise RuntimeError(f'Replacement too long: {new}')
+              repl = new_b + b'\0' * (len(old_b) - len(new_b))
+              count = data.count(old_b)
+              if count:
+                  data = data.replace(old_b, repl)
+              print(f'{old}: replaced {count}')
+
+          # Disable every old injected load command. The fixed tweak will be
+          # injected fresh by cyan in the next step.
+          replace_padded('@rpath/blatantsPatch.dylib', '@rpath/noPatch.dylib')
+          replace_padded('@rpath/ReturnYouTubeMusicDislikes.dylib', '@rpath/noDislikes.dylib')
+          replace_padded('@rpath/YTMusicUltimate.dylib', '@rpath/YTMDisabled.dylib')
+          exe.write_bytes(data)
+
+          for rel in [
+              'Frameworks/blatantsPatch.dylib',
+              'Frameworks/ReturnYouTubeMusicDislikes.dylib',
+              'Frameworks/YTMusicUltimate.dylib',
+              'Frameworks/CydiaSubstrate.framework',
+              'YTMusicUltimate.bundle',
+          ]:
+              p = app / rel
+              if p.is_dir():
+                  shutil.rmtree(p, ignore_errors=True)
+              elif p.exists():
+                  p.unlink()
+
+          # Remove stale signatures; the injector will fakesign again and
+          # ESign will apply the real AppTester signature afterward.
+          for sig in app.rglob('_CodeSignature'):
+              if sig.is_dir():
+                  shutil.rmtree(sig, ignore_errors=True)
+          PY
+
+          cd work
+          zip -qry ../cleanbase.ipa Payload
+          cd ..
+          unzip -tq cleanbase.ipa
+
+      - name: Install cyan injector
+        run: pipx install --force https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
+
+      - name: Download YTMusicUltimate 2.4.1 fixed-download package
+        run: |
+          curl -fL --retry 3 --retry-delay 2 \
+            -o fixed-downloads.deb \
+            https://files.catbox.moe/u8c7df.deb
+          test -s fixed-downloads.deb
+
+      - name: Inject fixed downloader and preserve AppTester bundle ID
+        run: |
+          cyan \
+            -i cleanbase.ipa \
+            -o YTMusicUltimate_9.26.2_LockScreen_DownloadFix.ipa \
+            -u -w -s -f fixed-downloads.deb \
+            -n "$APP_NAME" \
+            -b "$BUNDLE_ID" \
+            --overwrite
+          unzip -tq YTMusicUltimate_9.26.2_LockScreen_DownloadFix.ipa
+
+      - name: Verify final IPA
+        run: |
+          rm -rf verify
+          unzip -q YTMusicUltimate_9.26.2_LockScreen_DownloadFix.ipa -d verify
+          python3 <<'PY'
+          import plistlib
+          from pathlib import Path
+
+          app = Path('verify/Payload/YouTubeMusic.app')
+          with open(app / 'Info.plist', 'rb') as f:
+              info = plistlib.load(f)
+
+          bundle = info.get('CFBundleIdentifier')
+          print('Bundle ID:', bundle)
+          if bundle != 'app.raspberry1880.gooseberry6361':
+              raise SystemExit('Unexpected bundle ID')
+
+          dylib = app / 'Frameworks/YTMusicUltimate.dylib'
+          if not dylib.exists():
+              raise SystemExit('Fixed YTMusicUltimate.dylib was not injected')
+          print('YTMusicUltimate dylib size:', dylib.stat().st_size)
+          PY
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2.5.0
+        with:
+          tag_name: download-fix-${{ github.run_number }}
+          name: YouTube Music 9.26.2 - Lock Screen + Download Fix
+          files: YTMusicUltimate_9.26.2_LockScreen_DownloadFix.ipa
+          draft: true
+
+      - name: Output release URL
+        run: echo "::notice::Fixed IPA available at https://github.com/${GITHUB_REPOSITORY}/releases"
